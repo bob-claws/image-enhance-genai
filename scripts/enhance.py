@@ -282,6 +282,31 @@ def main() -> int:
         default=None,
         help="Output PNG path. Default: ./out/<timestamp>-enhanced.png",
     )
+    ap.add_argument(
+        "--gif",
+        action="store_true",
+        help=(
+            "Also generate an 'ENHANCE' animated GIF of the progressive steps (cropped area only). "
+            "When used with --progressive, the GIF shows: original crop -> stage1-informed crop -> final enhance."
+        ),
+    )
+    ap.add_argument(
+        "--gif-path",
+        default=None,
+        help="Output GIF path (default: same as --out but with .gif)",
+    )
+    ap.add_argument(
+        "--gif-fps",
+        type=int,
+        default=12,
+        help="GIF frame rate (default 12)",
+    )
+    ap.add_argument(
+        "--gif-seconds",
+        type=float,
+        default=3.0,
+        help="GIF total duration in seconds (default 3.0)",
+    )
     args = ap.parse_args()
 
     inp = Path(args.input).expanduser().resolve()
@@ -429,11 +454,115 @@ def main() -> int:
         crop_and_preup(inp, crop_path, x, y, crop_px)
         genai(crop_path, out_path)
 
+    # Optional GIF generation (cropped area only)
+    if args.gif:
+        gif_path = Path(args.gif_path) if args.gif_path else out_path.with_suffix(".gif")
+        gif_path = gif_path.resolve()
+        gif_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Build 3-frame "progressive enhance" animation when possible
+        frames: list[Path] = []
+
+        # For progressive+guide we can show original crop -> stage2_pre -> final
+        if args.progressive and args.guide:
+            # Recompute bbox + center in base space
+            gpath = Path(args.guide).expanduser().resolve()
+            gx, gy, gw, gh = detect_annotation_bbox(inp, gpath, diff_thresh=args.diff_thresh, blur_ksize=args.diff_blur)
+            bbox_side = max(gw, gh)
+            cx_px = gx + gw / 2
+            cy_px = gy + gh / 2
+
+            # Original-space "final" crop (before any GenAI), padded with final_pad
+            side0 = ensure_even(max(64, int(round(bbox_side * float(args.final_pad)))))
+            side0 = min(side0, w, h)
+            x0 = int(round(cx_px - side0 / 2))
+            y0 = int(round(cy_px - side0 / 2))
+            x0 = max(0, min(x0, w - side0))
+            y0 = max(0, min(y0, h - side0))
+
+            frame0 = tmp_dir / "gif-0-orig.png"
+            crop_and_preup(inp, frame0, x0, y0, side0)
+
+            # Stage2 pre-upscale (already exists in tmp_dir when progressive+guide)
+            frame1 = tmp_dir / "stage2-preup.png"
+
+            frames = [frame0, frame1, out_path]
+        else:
+            # Fallback: just blink from the single-stage preup crop to final
+            frame0 = crop_path
+            frames = [frame0, out_path]
+
+        # Normalize all frames to the same size (use the smallest side among them)
+        dims = [ffprobe_dims(p) for p in frames]
+        side = min(min(w0, h0) for (w0, h0) in dims)
+        side = max(256, min(side, 1024))  # keep GIF reasonable
+
+        norm_dir = tmp_dir / "gif-frames"
+        norm_dir.mkdir(parents=True, exist_ok=True)
+        norm_frames: list[Path] = []
+        for i, fp in enumerate(frames):
+            out_fp = norm_dir / f"f{i:02d}.png"
+            run(["ffmpeg", "-y", "-i", str(fp), "-vf", f"scale={side}:{side}:flags=bilinear", str(out_fp)])
+            norm_frames.append(out_fp)
+
+        # Build a short mp4 with crossfades, then convert to GIF with palette
+        mp4_path = tmp_dir / "enhance.mp4"
+        palette = tmp_dir / "palette.png"
+
+        # Each still shown for (gif_seconds / len(frames)) seconds, with small crossfade
+        n = len(norm_frames)
+        seg = max(0.5, float(args.gif_seconds) / n)
+        fade = min(0.25, seg * 0.35)
+
+        # Create inputs
+        ff = ["ffmpeg", "-y"]
+        for nf in norm_frames:
+            ff += ["-loop", "1", "-t", f"{seg}", "-i", str(nf)]
+
+        # xfade chain
+        # offsets are where each transition starts in the accumulating timeline
+        filt = ""
+        if n == 2:
+            filt = f"[0:v][1:v]xfade=transition=fade:duration={fade}:offset={seg-fade},format=yuv420p[v]"
+        else:
+            # [0][1] -> v01, then v01 with [2] ...
+            offset1 = seg - fade
+            filt = f"[0:v][1:v]xfade=transition=fade:duration={fade}:offset={offset1}[v01];"
+            cur = "v01"
+            for idx in range(2, n):
+                # timeline length grows by seg each time, but overlap by fade
+                offset = idx * seg - fade * (idx)
+                nxt = f"v{idx:02d}"
+                filt += f"[{cur}][{idx}:v]xfade=transition=fade:duration={fade}:offset={offset}[{nxt}];"
+                cur = nxt
+            filt += f"[{cur}]format=yuv420p[v]"
+
+        ff += ["-filter_complex", filt, "-map", "[v]", "-r", str(args.gif_fps), str(mp4_path)]
+        run(ff)
+
+        # Palette + GIF
+        fps = max(6, int(args.gif_fps))
+        run(["ffmpeg", "-y", "-i", str(mp4_path), "-vf", f"fps={fps},scale=640:-1:flags=lanczos,palettegen", str(palette)])
+        run([
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(mp4_path),
+            "-i",
+            str(palette),
+            "-lavfi",
+            f"fps={fps},scale=640:-1:flags=lanczos[x];[x][1:v]paletteuse",
+            str(gif_path),
+        ])
+
+        print(f"MEDIA:{gif_path}")
+
     # Best-effort cleanup
     try:
-        for p in tmp_dir.glob("*"):
-            p.unlink(missing_ok=True)
-        tmp_dir.rmdir()
+        if not args.gif:
+            for p in tmp_dir.glob("*"):
+                p.unlink(missing_ok=True)
+            tmp_dir.rmdir()
     except Exception:
         pass
 
